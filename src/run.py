@@ -1,150 +1,208 @@
-from isaacsim import SimulationApp
+"""Drive a Franka Panda EE with live MAVC commands over TCP via IsaacLab Diff IK.
 
-# hide_ui: hides main Kit chrome (menus, docks, outliner, etc.). It does not strip
-# viewport-local HUD, guides, or viewport extension menubars -- see demo_viewport.
-simulation_app = SimulationApp({"headless": False, "hide_ui": True})
+This script mirrors ``ref.py`` (the IsaacLab differential-IK tutorial) for
+scene/controller setup, but the goal is no longer a hard-coded list of poses
+that cycle every 150 ticks. Instead, a :class:`mavc_receiver.Receiver` listens
+for binary ``Command`` frames; each one is converted from camera-frame
+``palm_position`` + ``palm_orientation`` to a root-frame
+``[x, y, z, qw, qx, qy, qz]`` IK target via
+:func:`utils.transforms.camera_xyzrpy_to_root_pose7`.
 
-from core.robot import Robot
-from core.controller import DifferentialIKController
-from core.robot_config import RobotConfig
-from scene.create_scene import load_pick_place_scene
-from utils.transforms import convert_wrist_pose
+Run with::
 
-from pathlib import Path
-import numpy as np
-from isaacsim.core.api import World
-import omni.kit.viewport.utility as vu
-from isaacsim.core.prims import Articulation
+    ./isaaclab.sh -p src/run.py
 
-script_dir = Path(__file__).resolve().parent
-SCENE_PATH = script_dir / "scene" / "assets" / "pick_place_scene.usd"
-ROBOT_PRIM_PATH = "/World/lite6"
-CAMERA_PRIM_PATH = "/World/Camera"
+Then point a MAVC-Sender at ``<host>:<port>`` (default ``0.0.0.0:9000``).
+"""
 
-EE_BODY_NAME = "link6"
-IK_JOINT_NAMES = ("joint1", "joint2", "joint3", "joint4", "joint5", "joint6")
+import argparse
 
-# Controller convergence settings -- tweak if poses are missed.
-IK_STEP_SIZE = 0.5
-IK_POS_TOL = 1e-3       # meters
-IK_ROT_TOL = 1e-2       # radians (~0.57 deg)
-IK_DAMPING = 1e-2
-MAX_STEPS_PER_POSE = 300
+from isaaclab.app import AppLauncher
 
-CAMERA_FRAME_TEST_MESSAGES: list[tuple[float, float, float, float, float, float]] = [
-    (0.30, 0.10, 0.40, 0.0, 0.0, 0.0),
-    # (0.35, -0.05, 0.40, 0.1, -0.15, 0.2),
-    # (0.25, 0.15, 0.40, -0.05, 0.1, -0.3),
-    # (0.30, 0.10, 0.50, 0.0, 0.0, 0.0),
-]
+parser = argparse.ArgumentParser(description="MAVC-Example live diff-IK demo (Franka Panda).")
+parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to spawn.")
+parser.add_argument("--mavc_host", type=str, default="0.0.0.0", help="MAVC-Receiver bind host.")
+parser.add_argument("--mavc_port", type=int, default=9000, help="MAVC-Receiver bind port.")
+parser.add_argument(
+    "--mavc_reach",
+    type=float,
+    default=0.6,
+    help="Meters of max reach. Multiplies the normalized palm_position from each Command.",
+)
+AppLauncher.add_app_launcher_args(parser)
+args_cli = parser.parse_args()
 
-# Targets expressed directly in robot/world frame, so they are independent of
-# ``convert_wrist_pose``. Use these to verify the differential-IK controller
-# in isolation. Identity orientation == link6 axes aligned with world axes.
-def _identity_pose(x: float, y: float, z: float) -> np.ndarray:
-    T = np.eye(4)
-    T[:3, 3] = (x, y, z)
-    return T
+app_launcher = AppLauncher(args_cli)
+simulation_app = app_launcher.app
 
+"""Rest everything follows."""
 
-ROBOT_FRAME_TEST_TARGETS: list[np.ndarray] = [
-    _identity_pose(0.30, 0.0, 0.30),
-    _identity_pose(0.25, 0.10, 0.25),
-    _identity_pose(0.20, -0.10, 0.35),
-]
+import torch
 
+import isaaclab.sim as sim_utils
+from isaaclab.assets import AssetBaseCfg
+from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.markers import VisualizationMarkers
+from isaaclab.markers.config import FRAME_MARKER_CFG
+from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
+from isaaclab.utils import configclass
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+from isaaclab.utils.math import subtract_frame_transforms
 
-def move_robot_from_camera_xyzrpy(
-    robot: Robot,
-    world: World,
-    x: float,
-    y: float,
-    z: float,
-    roll: float,
-    pitch: float,
-    yaw: float,
-    max_steps: int = MAX_STEPS_PER_POSE,
-) -> bool:
-    """Pretend one MAVC message arrived: position + ZYX rpy in camera frame."""
-    T = convert_wrist_pose([x, y, z], roll, pitch, yaw)
-    return robot.move_to(T, world=world, max_steps=max_steps)
+from isaaclab_assets import FRANKA_PANDA_HIGH_PD_CFG  # isort:skip
+
+from mavc_receiver import Command, Receiver
+from mavc_receiver.cfg_parser import ReceiverCfg
+
+from utils.transforms import camera_xyzrpy_to_root_pose7
 
 
-def run_camera_frame_message_tests(
-    robot: Robot,
-    world: World,
-    max_steps_per_pose: int = MAX_STEPS_PER_POSE,
-) -> None:
-    """Apply each synthetic camera-frame message and report convergence."""
-    for i, (x, y, z, roll, pitch, yaw) in enumerate(CAMERA_FRAME_TEST_MESSAGES):
-        print(f"[MAVC-Example] === Camera-frame test {i} ===")
-        robot.log_current_joint_positions(label=f"camera test {i} pre")
-        converged = move_robot_from_camera_xyzrpy(
-            robot, world, x, y, z, roll, pitch, yaw, max_steps=max_steps_per_pose
-        )
-        robot.log_current_joint_positions(label=f"camera test {i} post")
-        status = "converged" if converged else "did NOT converge"
-        print(f"[MAVC-Example] camera test {i}: {status}")
+@configclass
+class TableTopSceneCfg(InteractiveSceneCfg):
+    """Single-arm tabletop scene (Franka Panda)."""
 
-
-def run_robot_frame_target_tests(
-    robot: Robot,
-    world: World,
-    max_steps_per_pose: int = MAX_STEPS_PER_POSE,
-) -> None:
-    """Drive the EE to each ``ROBOT_FRAME_TEST_TARGETS`` pose (no frame conversion)."""
-    for i, T in enumerate(ROBOT_FRAME_TEST_TARGETS):
-        print(f"[MAVC-Example] === Robot-frame test {i} ===")
-        robot.log_current_joint_positions(label=f"robot test {i} pre")
-        converged = robot.move_to(T, world=world, max_steps=max_steps_per_pose)
-        robot.log_current_joint_positions(label=f"robot test {i} post")
-        status = "converged" if converged else "did NOT converge"
-        print(f"[MAVC-Example] robot test {i}: {status}")
-
-
-def main() -> None:
-    load_pick_place_scene(SCENE_PATH)
-    vp_api, _vp_window = vu.get_active_viewport_and_window()
-    vp_api.camera_path = CAMERA_PRIM_PATH
-
-    world = World()
-    arm = Articulation(prim_paths_expr=ROBOT_PRIM_PATH, name="pick_place_arm")
-    world.scene.add(arm)
-    world.reset()
-
-    controller = DifferentialIKController(
-        articulation=arm,
-        ee_body_name=EE_BODY_NAME,
-        ik_joint_names=IK_JOINT_NAMES,
-        step_size=IK_STEP_SIZE,
-        pos_tol=IK_POS_TOL,
-        rot_tol=IK_ROT_TOL,
-        damping=IK_DAMPING,
+    ground = AssetBaseCfg(
+        prim_path="/World/defaultGroundPlane",
+        spawn=sim_utils.GroundPlaneCfg(),
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, -1.05)),
     )
-    robot = Robot(config=RobotConfig(), articulation=arm, controller=controller)
 
-    # Let the arm settle into its rest pose before issuing IK commands.
-    for _ in range(60):
-        world.step(render=True)
+    dome_light = AssetBaseCfg(
+        prim_path="/World/Light",
+        spawn=sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75)),
+    )
 
-    # Run the robot-frame tests first to validate the differential-IK controller
-    # in isolation, then exercise the camera-frame pipeline.
-    run_robot_frame_target_tests(robot, world)
-    run_camera_frame_message_tests(robot, world)
+    table = AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/Table",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Mounts/Stand/stand_instanceable.usd",
+            scale=(2.0, 2.0, 2.0),
+        ),
+    )
 
-    while simulation_app.is_running():
-        world.step(render=True)
+    robot = FRANKA_PANDA_HIGH_PD_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+
+def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
+    """Runs the simulation loop with live MAVC commands."""
+    robot = scene["robot"]
+
+    diff_ik_cfg = DifferentialIKControllerCfg(command_type="pose", use_relative_mode=False, ik_method="dls")
+    diff_ik_controller = DifferentialIKController(diff_ik_cfg, num_envs=scene.num_envs, device=sim.device)
+
+    frame_marker_cfg = FRAME_MARKER_CFG.copy()
+    frame_marker_cfg.markers["frame"].scale = (0.1, 0.1, 0.1)
+    ee_marker = VisualizationMarkers(frame_marker_cfg.replace(prim_path="/Visuals/ee_current"))
+    goal_marker = VisualizationMarkers(frame_marker_cfg.replace(prim_path="/Visuals/ee_goal"))
+
+    robot_entity_cfg = SceneEntityCfg("robot", joint_names=["panda_joint.*"], body_names=["panda_hand"])
+    robot_entity_cfg.resolve(scene)
+    # For a fixed base robot, the frame index is one less than the body index. This is because
+    # the root body is not included in the returned Jacobians.
+    if robot.is_fixed_base:
+        ee_jacobi_idx = robot_entity_cfg.body_ids[0] - 1
+    else:
+        ee_jacobi_idx = robot_entity_cfg.body_ids[0]
+
+    # Reset the arm to its default joint state so we have a known starting pose.
+    joint_pos = robot.data.default_joint_pos.clone()
+    joint_vel = robot.data.default_joint_vel.clone()
+    robot.write_joint_state_to_sim(joint_pos, joint_vel)
+    robot.reset()
+    scene.write_data_to_sim()
+
+    # Initialize the IK command to the EE's current root-frame pose so the arm
+    # holds station until the first MAVC command arrives.
+    sim_dt = sim.get_physics_dt()
+    scene.update(sim_dt)
+    ee_pose_w = robot.data.body_pose_w[:, robot_entity_cfg.body_ids[0]]
+    root_pose_w = robot.data.root_pose_w
+    init_pos_b, init_quat_b = subtract_frame_transforms(
+        root_pose_w[:, 0:3], root_pose_w[:, 3:7], ee_pose_w[:, 0:3], ee_pose_w[:, 3:7]
+    )
+    ik_commands = torch.zeros(scene.num_envs, diff_ik_controller.action_dim, device=robot.device)
+    ik_commands[:, 0:3] = init_pos_b
+    ik_commands[:, 3:7] = init_quat_b
+    diff_ik_controller.reset()
+    diff_ik_controller.set_command(ik_commands)
+
+    # === MAVC-Receiver wiring ===========================================
+    # Every Command updates ``ik_commands`` in place; the next IK ``compute()``
+    # picks up the new target. The callback runs on the main thread inside
+    # ``rx.spin_once()``, so no locking is required.
+    rx_cfg = ReceiverCfg(bind_host=args_cli.mavc_host, bind_port=args_cli.mavc_port)
+    rx = Receiver(rx_cfg)
+
+    def on_command(_rx: Receiver, cmd: Command) -> None:
+        px, py, pz = cmd.palm_position
+        roll, pitch, yaw = cmd.palm_orientation
+        scale = float(args_cli.mavc_reach)
+        cam_xyz_m = (px * scale, py * scale, pz * scale)
+        target7 = camera_xyzrpy_to_root_pose7(*cam_xyz_m, roll, pitch, yaw)
+        target_tensor = torch.tensor(target7, device=ik_commands.device, dtype=ik_commands.dtype)
+        ik_commands[:, 0:7] = target_tensor
+        diff_ik_controller.reset()
+        diff_ik_controller.set_command(ik_commands)
+        print(
+            f"[MAVC-Example] seq={cmd.sequence_id} "
+            f"cam_xyz_m=({cam_xyz_m[0]:+.3f},{cam_xyz_m[1]:+.3f},{cam_xyz_m[2]:+.3f}) "
+            f"rpy=({roll:+.3f},{pitch:+.3f},{yaw:+.3f}) "
+            f"-> root_pos=({target7[0]:+.3f},{target7[1]:+.3f},{target7[2]:+.3f}) "
+            f"root_quat_wxyz=({target7[3]:+.3f},{target7[4]:+.3f},{target7[5]:+.3f},{target7[6]:+.3f}) "
+            f"grip={cmd.grip_amount:.2f}"
+        )
+
+    rx.register_callback(on_command, execute_on_spin=True)
+    rx.run()
+    print(f"[MAVC-Example] MAVC-Receiver listening on {rx_cfg.bind_host}:{rx_cfg.bind_port} (plain TCP)")
+
+    try:
+        while simulation_app.is_running():
+            # Drain any pending Commands (each spin_once dequeues at most one).
+            while rx.spin_once():
+                pass
+
+            # obtain quantities from simulation
+            jacobian = robot.root_physx_view.get_jacobians()[:, ee_jacobi_idx, :, robot_entity_cfg.joint_ids]
+            ee_pose_w = robot.data.body_pose_w[:, robot_entity_cfg.body_ids[0]]
+            root_pose_w = robot.data.root_pose_w
+            joint_pos = robot.data.joint_pos[:, robot_entity_cfg.joint_ids]
+            # compute frame in root frame
+            ee_pos_b, ee_quat_b = subtract_frame_transforms(
+                root_pose_w[:, 0:3], root_pose_w[:, 3:7], ee_pose_w[:, 0:3], ee_pose_w[:, 3:7]
+            )
+            # compute the joint commands
+            joint_pos_des = diff_ik_controller.compute(ee_pos_b, ee_quat_b, jacobian, joint_pos)
+
+            # apply actions
+            robot.set_joint_position_target(joint_pos_des, joint_ids=robot_entity_cfg.joint_ids)
+            scene.write_data_to_sim()
+            # perform step
+            sim.step()
+            # update buffers
+            scene.update(sim_dt)
+
+            # update marker positions
+            ee_pose_w = robot.data.body_state_w[:, robot_entity_cfg.body_ids[0], 0:7]
+            ee_marker.visualize(ee_pose_w[:, 0:3], ee_pose_w[:, 3:7])
+            goal_marker.visualize(ik_commands[:, 0:3] + scene.env_origins, ik_commands[:, 3:7])
+    finally:
+        rx.stop()
+
+
+def main():
+    """Main function."""
+    sim_cfg = sim_utils.SimulationCfg(dt=0.01, device=args_cli.device)
+    sim = sim_utils.SimulationContext(sim_cfg)
+    sim.set_camera_view([2.5, 2.5, 2.5], [0.0, 0.0, 0.0])
+    scene_cfg = TableTopSceneCfg(num_envs=args_cli.num_envs, env_spacing=2.0)
+    scene = InteractiveScene(scene_cfg)
+    sim.reset()
+    print("[INFO]: Setup complete...")
+    run_simulator(sim, scene)
 
 
 if __name__ == "__main__":
-    try:
-        import traceback
-        import logging
-
-        main()
-    except Exception:
-        traceback.print_exc()
-        logging.exception("Unhandled exception in main")
-        raise
-    finally:
-        simulation_app.close()
+    main()
+    simulation_app.close()
