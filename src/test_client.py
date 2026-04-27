@@ -28,17 +28,21 @@ from mavc_receiver import Command, CommandParser
 MAGIC = 0x073CD
 VERSION = 1
 
-# Normalized camera-frame poses: each row is (px, py, pz, roll, pitch, yaw, grip).
-# ``palm_position`` is normalized; the receiver multiplies by ``--mavc_reach``
-# (default 0.6 m). With reach=0.6, these correspond to camera-frame meters
-# roughly (0.48, -0.36..-0.48, +/-0.24), and after the camera->root mapping
-# in utils.transforms (cam X->root X, cam Y->root -Z, cam Z->root -Y) they
-# land near root-frame (0.48, +/-0.24, +0.36..0.48) -- inside the Panda's
-# typical workspace.
+# MediaPipe-style camera-frame poses: each row is (px, py, pz, roll, pitch, yaw, grip).
+# ``palm_position`` uses raw MediaPipe pose-landmark units -- ``px``/``py`` are
+# normalized image coords with the image's top-left as origin (so both are in
+# ``[0, 1]`` and the optical axis is at ``(0.5, 0.5)``), and ``pz`` is signed
+# depth. The receiver re-centers ``(px, py)`` by ``(-0.5, -0.5)`` and then
+# multiplies all three components by ``--mavc_reach`` (default 0.6 m). With
+# reach=0.6, the poses below map to camera-frame meters roughly
+# ``(+0.24, -0.24, +/-0.24)`` and ``(+0.18, -0.30, 0)``; after the camera->root
+# axis swap in utils.transforms (cam X->root X, cam Y->root -Z, cam Z->root -Y)
+# they land near root-frame ``(0.24, +/-0.24, +0.24)`` and ``(0.18, 0, +0.30)``
+# -- inside the Panda's typical workspace.
 DEFAULT_POSES: list[Tuple[float, float, float, float, float, float, float]] = [
-    (0.80, -0.60,  0.40, 0.0, 0.0, 0.0, 0.0),
-    (0.80, -0.60, -0.40, 0.0, 0.0, 0.0, 0.0),
-    (0.60, -0.80,  0.00, 0.0, 0.0, 0.0, 0.5),
+    (0.90, 0.10,  0.40, 0.0, 0.0, 0.0, 0.0),
+    (0.90, 0.10, -0.40, 0.0, 0.0, 0.0, 0.0),
+    (0.80, 0.00,  0.00, 0.0, 0.0, 0.0, 0.5),
 ]
 
 

@@ -27,7 +27,10 @@ parser.add_argument(
     "--mavc_reach",
     type=float,
     default=0.6,
-    help="Meters of max reach. Multiplies the normalized palm_position from each Command.",
+    help=(
+        "Meters of max reach. Multiplies the (re-centered) palm_position from each "
+        "Command after shifting raw MediaPipe image coords by (-0.5, -0.5, 0)."
+    ),
 )
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -138,7 +141,10 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         px, py, pz = cmd.palm_position
         roll, pitch, yaw = cmd.palm_orientation
         scale = float(args_cli.mavc_reach)
-        cam_xyz_m = (px * scale, py * scale, pz * scale)
+        # MediaPipe ships x,y as image-plane coords with the top-left as origin
+        # (so the optical axis is at (0.5, 0.5)); shift to centered coords before
+        # scaling to meters. z is already signed depth, so it scales as-is.
+        cam_xyz_m = ((px - 0.5) * scale, (py - 0.5) * scale, pz * scale)
         target7 = camera_xyzrpy_to_root_pose7(*cam_xyz_m, roll, pitch, yaw)
         target_tensor = torch.tensor(target7, device=ik_commands.device, dtype=ik_commands.dtype)
         ik_commands[:, 0:7] = target_tensor
