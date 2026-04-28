@@ -50,12 +50,12 @@ parser.add_argument(
 parser.add_argument(
     "--receive_hz",
     type=float,
-    default=2.0,
+    default=1.0,
     help=(
-        "Max rate (Hz) at which the MAVC receive queue is drained. The "
-        "simulation loop only calls ``rx.spin_once()`` when at least "
-        "``1 / receive_hz`` seconds have elapsed since the last drain. "
-        "Set to <= 0 to drain on every physics tick (no throttle)."
+        "Max rate (Hz) at which drained MAVC commands are applied to the IK "
+        "target. The receive queue itself is still drained at 30 Hz to match "
+        "the sender and avoid backlog. Set to <= 0 to apply the latest "
+        "drained command every physics tick."
     ),
 )
 AppLauncher.add_app_launcher_args(parser)
@@ -147,17 +147,23 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     diff_ik_controller.set_command(ik_commands)
 
     # === MAVC-Receiver wiring ===========================================
-    # Every Command updates ``ik_commands`` in place; the next IK ``compute()``
-    # picks up the new target. The callback runs on the main thread inside
-    # ``rx.spin_once()``, so no locking is required.
+    # The sender publishes at 30 Hz, so drain the queue at that rate to avoid
+    # backlog. The callback only records the newest command; the main loop
+    # applies that latest command to IK at ``--receive_hz``.
     rx_cfg = ReceiverCfg(bind_host=args_cli.mavc_host, bind_port=args_cli.mavc_port)
     rx = Receiver(rx_cfg)
 
     shoulder_origin_in_robot = tuple(float(v) for v in args_cli.shoulder_xyz)
+    latest_cmd: Command | None = None
 
     def on_command(_rx: Receiver, cmd: Command) -> None:
+        nonlocal latest_cmd
+        latest_cmd = cmd
+
+    def apply_command(cmd: Command) -> None:
         px, py, pz = cmd.palm_position
         roll, pitch, yaw = cmd.palm_orientation
+        print(f"Pre-transform --> r: {roll}, p:{pitch}, y:{yaw}")
         scale = float(args_cli.mavc_reach)
         # palm_position is shoulder-frame normalized coords (origin at the
         # shoulder, axes parallel to the camera frame). Just scale to meters.
@@ -186,20 +192,27 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     rx.run()
     print(f"[MAVC-Example] MAVC-Receiver listening on {rx_cfg.bind_host}:{rx_cfg.bind_port} (plain TCP)")
 
-    receive_hz = float(args_cli.receive_hz)
-    spin_period = 1.0 / receive_hz if receive_hz > 0.0 else 0.0
+    drain_period = 1.0 / 30.0
+    command_hz = float(args_cli.receive_hz)
+    command_period = 1.0 / command_hz if command_hz > 0.0 else 0.0
     last_spin_time = 0.0
+    last_command_time = 0.0
 
     try:
         while simulation_app.is_running():
-            # Drain any pending Commands (each spin_once dequeues at most one),
-            # but only after ``spin_period`` seconds have elapsed since the last
-            # drain. Setting --receive_hz <= 0 reverts to draining every tick.
             now = time.monotonic()
-            if now - last_spin_time >= spin_period:
+            # Drain at the sender's fixed 30 Hz rate. The callback stores only
+            # the newest command, so intermediate messages are intentionally
+            # dropped when ``--receive_hz`` is lower than 30.
+            if now - last_spin_time >= drain_period:
                 while rx.spin_once():
                     pass
                 last_spin_time = now
+
+            if latest_cmd is not None and now - last_command_time >= command_period:
+                apply_command(latest_cmd)
+                latest_cmd = None
+                last_command_time = now
 
             # obtain quantities from simulation
             jacobian = robot.root_physx_view.get_jacobians()[:, ee_jacobi_idx, :, robot_entity_cfg.joint_ids]
@@ -233,7 +246,7 @@ def main():
     """Main function."""
     sim_cfg = sim_utils.SimulationCfg(dt=0.01, device=args_cli.device)
     sim = sim_utils.SimulationContext(sim_cfg)
-    sim.set_camera_view([2.5, 0.0, 2.5], [0.0, 0.0, 0.0])
+    sim.set_camera_view([2.5, 0.0, 2.0], [0.0, 0.0, 0.0])
     scene_cfg = TableTopSceneCfg(num_envs=args_cli.num_envs, env_spacing=2.0)
     scene = InteractiveScene(scene_cfg)
     sim.reset()

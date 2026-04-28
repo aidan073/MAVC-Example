@@ -43,7 +43,7 @@ VERSION = 1
 # is passed to ``run.py``. With ``--shoulder_xyz 0.5 0.3 0.4`` they land near
 # ``(0.26..0.74, 0.06, 0.4)`` -- inside the Panda's reach envelope.
 DEFAULT_POSES: list[Tuple[float, float, float, float, float, float, float]] = [
-    (1.00, 0.00, 0.00, 0.0, 0.0, 0.0, 0.0),
+    (0.00, 1.00, 0.00, 1.57, 0.0, 0.0, 0.0),
     (-0.40, 0.00, +0.40, 0.0, 0.0, 0.0, 0.0),
     ( 0.00, 0.00, +0.40, 0.0, 0.0, 0.0, 0.5),
 ]
@@ -70,7 +70,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Bare-bones MAVC test client.")
     ap.add_argument("--host", default="127.0.0.1", help="Receiver host (default: 127.0.0.1).")
     ap.add_argument("--port", type=int, default=9000, help="Receiver port (default: 9000).")
-    ap.add_argument("--rate_hz", type=float, default=20.0, help="Send rate when cycling (default: 20).")
+    ap.add_argument("--rate_hz", type=float, default=30.0, help="Send rate when cycling (default: 20).")
     ap.add_argument(
         "--hold_s",
         type=float,
