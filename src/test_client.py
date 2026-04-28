@@ -2,7 +2,7 @@
 
 Connects to a MAVC-Receiver TCP server (e.g. the one started by
 ``src/run.py``) and either sends one Command and exits, or streams a small
-cycle of camera-frame poses at a fixed rate.
+cycle of shoulder-frame poses at a fixed rate.
 
 This script intentionally has zero IsaacLab / IsaacSim dependencies -- it only
 needs the ``mavc_receiver`` package (for ``Command`` + ``CommandParser``).
@@ -14,7 +14,11 @@ Usage::
     python test_client.py --host 127.0.0.1 --port 9000
 
 Pair with ``run.py``'s defaults: it listens on ``0.0.0.0:9000`` and rescales
-``palm_position`` by ``--mavc_reach`` (default ``0.6 m``).
+``palm_position`` by ``--mavc_reach`` (default ``0.6 m``). For the demo poses
+below to land inside the Panda's workspace, also pass a non-zero
+``--shoulder_xyz`` to ``run.py``, e.g.::
+
+    ./isaaclab.sh -p src/run.py --shoulder_xyz 0.5 0.3 0.4
 """
 
 import argparse
@@ -28,21 +32,20 @@ from mavc_receiver import Command, CommandParser
 MAGIC = 0x073CD
 VERSION = 1
 
-# MediaPipe-style camera-frame poses: each row is (px, py, pz, roll, pitch, yaw, grip).
-# ``palm_position`` uses raw MediaPipe pose-landmark units -- ``px``/``py`` are
-# normalized image coords with the image's top-left as origin (so both are in
-# ``[0, 1]`` and the optical axis is at ``(0.5, 0.5)``), and ``pz`` is signed
-# depth. The receiver re-centers ``(px, py)`` by ``(-0.5, -0.5)`` and then
-# multiplies all three components by ``--mavc_reach`` (default 0.6 m). With
-# reach=0.6, the poses below map to camera-frame meters roughly
-# ``(+0.24, -0.24, +/-0.24)`` and ``(+0.18, -0.30, 0)``; after the camera->root
-# axis swap in utils.transforms (cam X->root X, cam Y->root -Z, cam Z->root -Y)
-# they land near root-frame ``(0.24, +/-0.24, +0.24)`` and ``(0.18, 0, +0.30)``
-# -- inside the Panda's typical workspace.
+# Shoulder-frame normalized poses: each row is (px, py, pz, roll, pitch, yaw, grip).
+# ``palm_position`` is the wrist's position relative to the operator's shoulder,
+# expressed in the shoulder frame (which shares orientation with the camera
+# frame). Components are normalized; the receiver multiplies them by
+# ``--mavc_reach`` (default 0.6 m). With reach=0.6, the poses below map to
+# shoulder-frame meters roughly ``(+/-0.24, 0, +0.24)``; after the
+# shoulder->root axis swap in utils.transforms (X->X, Y->-Z, Z->-Y) they land
+# at root-frame offsets ``(+/-0.24, -0.24, 0)`` from whatever ``--shoulder_xyz``
+# is passed to ``run.py``. With ``--shoulder_xyz 0.5 0.3 0.4`` they land near
+# ``(0.26..0.74, 0.06, 0.4)`` -- inside the Panda's reach envelope.
 DEFAULT_POSES: list[Tuple[float, float, float, float, float, float, float]] = [
-    (0.90, 0.10,  0.40, 0.0, 0.0, 0.0, 0.0),
-    (0.90, 0.10, -0.40, 0.0, 0.0, 0.0, 0.0),
-    (0.80, 0.00,  0.00, 0.0, 0.0, 0.0, 0.5),
+    (1.00, 0.00, 0.00, 0.0, 0.0, 0.0, 0.0),
+    (-0.40, 0.00, +0.40, 0.0, 0.0, 0.0, 0.0),
+    ( 0.00, 0.00, +0.40, 0.0, 0.0, 0.0, 0.5),
 ]
 
 

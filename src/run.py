@@ -16,6 +16,7 @@ Then point a MAVC-Sender at ``<host>:<port>`` (default ``0.0.0.0:9000``).
 """
 
 import argparse
+import time
 
 from isaaclab.app import AppLauncher
 
@@ -26,10 +27,35 @@ parser.add_argument("--mavc_port", type=int, default=9000, help="MAVC-Receiver b
 parser.add_argument(
     "--mavc_reach",
     type=float,
-    default=0.6,
+    default=0.7,
     help=(
-        "Meters of max reach. Multiplies the (re-centered) palm_position from each "
-        "Command after shifting raw MediaPipe image coords by (-0.5, -0.5, 0)."
+        "Meters of max reach. Multiplies the normalized shoulder-frame "
+        "palm_position from each Command. e.g. ``palm_position=(1, 0, 0)`` with "
+        "reach=0.6 means 'wrist 0.6 m along the shoulder-frame +X axis'."
+    ),
+)
+parser.add_argument(
+    "--shoulder_xyz",
+    type=float,
+    nargs=3,
+    metavar=("X", "Y", "Z"),
+    default=[0.0, 0.0, 0.0],
+    help=(
+        "Where the operator's shoulder maps to in the robot root frame (meters). "
+        "Each Command's palm_position is wrist-relative-to-shoulder; this offset "
+        "is added to the axis-swapped result so a zero palm_position lands the EE "
+        "target at this point."
+    ),
+)
+parser.add_argument(
+    "--receive_hz",
+    type=float,
+    default=2.0,
+    help=(
+        "Max rate (Hz) at which the MAVC receive queue is drained. The "
+        "simulation loop only calls ``rx.spin_once()`` when at least "
+        "``1 / receive_hz`` seconds have elapsed since the last drain. "
+        "Set to <= 0 to drain on every physics tick (no throttle)."
     ),
 )
 AppLauncher.add_app_launcher_args(parser)
@@ -50,7 +76,6 @@ from isaaclab.markers import VisualizationMarkers
 from isaaclab.markers.config import FRAME_MARKER_CFG
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.math import subtract_frame_transforms
 
 from isaaclab_assets import FRANKA_PANDA_HIGH_PD_CFG  # isort:skip
@@ -68,20 +93,11 @@ class TableTopSceneCfg(InteractiveSceneCfg):
     ground = AssetBaseCfg(
         prim_path="/World/defaultGroundPlane",
         spawn=sim_utils.GroundPlaneCfg(),
-        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, -1.05)),
     )
 
     dome_light = AssetBaseCfg(
         prim_path="/World/Light",
         spawn=sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75)),
-    )
-
-    table = AssetBaseCfg(
-        prim_path="{ENV_REGEX_NS}/Table",
-        spawn=sim_utils.UsdFileCfg(
-            usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Mounts/Stand/stand_instanceable.usd",
-            scale=(2.0, 2.0, 2.0),
-        ),
     )
 
     robot = FRANKA_PANDA_HIGH_PD_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
@@ -137,22 +153,29 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     rx_cfg = ReceiverCfg(bind_host=args_cli.mavc_host, bind_port=args_cli.mavc_port)
     rx = Receiver(rx_cfg)
 
+    shoulder_origin_in_robot = tuple(float(v) for v in args_cli.shoulder_xyz)
+
     def on_command(_rx: Receiver, cmd: Command) -> None:
         px, py, pz = cmd.palm_position
         roll, pitch, yaw = cmd.palm_orientation
         scale = float(args_cli.mavc_reach)
-        # MediaPipe ships x,y as image-plane coords with the top-left as origin
-        # (so the optical axis is at (0.5, 0.5)); shift to centered coords before
-        # scaling to meters. z is already signed depth, so it scales as-is.
-        cam_xyz_m = ((px - 0.5) * scale, (py - 0.5) * scale, pz * scale)
-        target7 = camera_xyzrpy_to_root_pose7(*cam_xyz_m, roll, pitch, yaw)
+        # palm_position is shoulder-frame normalized coords (origin at the
+        # shoulder, axes parallel to the camera frame). Just scale to meters.
+        shoulder_xyz_m = (px * scale, py * scale, pz * scale)
+        target7 = camera_xyzrpy_to_root_pose7(
+            *shoulder_xyz_m,
+            roll,
+            pitch,
+            yaw,
+            shoulder_origin_in_robot=shoulder_origin_in_robot,
+        )
         target_tensor = torch.tensor(target7, device=ik_commands.device, dtype=ik_commands.dtype)
         ik_commands[:, 0:7] = target_tensor
         diff_ik_controller.reset()
         diff_ik_controller.set_command(ik_commands)
         print(
             f"[MAVC-Example] seq={cmd.sequence_id} "
-            f"cam_xyz_m=({cam_xyz_m[0]:+.3f},{cam_xyz_m[1]:+.3f},{cam_xyz_m[2]:+.3f}) "
+            f"shoulder_xyz_m=({shoulder_xyz_m[0]:+.3f},{shoulder_xyz_m[1]:+.3f},{shoulder_xyz_m[2]:+.3f}) "
             f"rpy=({roll:+.3f},{pitch:+.3f},{yaw:+.3f}) "
             f"-> root_pos=({target7[0]:+.3f},{target7[1]:+.3f},{target7[2]:+.3f}) "
             f"root_quat_wxyz=({target7[3]:+.3f},{target7[4]:+.3f},{target7[5]:+.3f},{target7[6]:+.3f}) "
@@ -163,11 +186,20 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     rx.run()
     print(f"[MAVC-Example] MAVC-Receiver listening on {rx_cfg.bind_host}:{rx_cfg.bind_port} (plain TCP)")
 
+    receive_hz = float(args_cli.receive_hz)
+    spin_period = 1.0 / receive_hz if receive_hz > 0.0 else 0.0
+    last_spin_time = 0.0
+
     try:
         while simulation_app.is_running():
-            # Drain any pending Commands (each spin_once dequeues at most one).
-            while rx.spin_once():
-                pass
+            # Drain any pending Commands (each spin_once dequeues at most one),
+            # but only after ``spin_period`` seconds have elapsed since the last
+            # drain. Setting --receive_hz <= 0 reverts to draining every tick.
+            now = time.monotonic()
+            if now - last_spin_time >= spin_period:
+                while rx.spin_once():
+                    pass
+                last_spin_time = now
 
             # obtain quantities from simulation
             jacobian = robot.root_physx_view.get_jacobians()[:, ee_jacobi_idx, :, robot_entity_cfg.joint_ids]
@@ -201,7 +233,7 @@ def main():
     """Main function."""
     sim_cfg = sim_utils.SimulationCfg(dt=0.01, device=args_cli.device)
     sim = sim_utils.SimulationContext(sim_cfg)
-    sim.set_camera_view([2.5, 2.5, 2.5], [0.0, 0.0, 0.0])
+    sim.set_camera_view([2.5, 2.5, 0.0], [0.0, 0.0, 0.0])
     scene_cfg = TableTopSceneCfg(num_envs=args_cli.num_envs, env_spacing=2.0)
     scene = InteractiveScene(scene_cfg)
     sim.reset()
